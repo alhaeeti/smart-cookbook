@@ -5,7 +5,12 @@ export async function extractRecipeFromUrl(url) {
     body: JSON.stringify({ url }),
   })
 
-  const data = await res.json()
+  let data
+  try {
+    data = await res.json()
+  } catch {
+    throw new Error('Could not extract recipe. The server returned an invalid response.')
+  }
 
   if (!res.ok) {
     throw new Error(data.error || 'Could not extract recipe from this URL. Try Import Text instead.')
