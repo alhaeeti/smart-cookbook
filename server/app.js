@@ -424,7 +424,7 @@ async function tryYoutubeExtraction(url) {
   const videoId = extractYoutubeVideoId(url)
   if (!videoId) {
     console.log('[youtube] Could not extract video ID')
-    return null
+    return { recipe: null, reason: 'failed', captionsAvailable: false }
   }
   console.log('[youtube] Video ID:', videoId)
 
@@ -433,25 +433,27 @@ async function tryYoutubeExtraction(url) {
   console.log('[youtube] Metadata:', JSON.stringify({ title: metadata.title?.slice(0, 60), descLen: metadata.description?.length, hasThumb: !!thumbnail }))
 
   const transcript = await fetchYoutubeTranscript(videoId)
-  if (!transcript.text) {
-    console.log('[youtube] No captions found for this video')
-    return { recipe: null, reason: 'no-captions' }
+  const captionsAvailable = !!transcript.text
+  if (captionsAvailable) {
+    console.log('[youtube] Captions found:', transcript.text.length, 'chars')
+  } else {
+    console.log('[youtube] No captions, using description + metadata')
   }
 
   let text = ''
   if (metadata.title) text += `Recipe Video Title: ${metadata.title}\n\n`
-  text += `Video Transcript:\n${transcript.text}\n\n`
+  if (transcript.text) text += `Video Transcript:\n${transcript.text}\n\n`
   if (metadata.description) text += `Video Description:\n${metadata.description}\n\n`
 
-  if (!text || text.length < 50) {
+  if (!text || text.length < 20) {
     console.log('[youtube] Not enough text for AI extraction')
-    return { recipe: null, reason: 'no-captions' }
+    return { recipe: null, reason: 'failed', captionsAvailable }
   }
 
   const recipe = await tryAiExtraction(text, url, 'YouTube', true)
   if (!recipe) {
     console.log('[youtube] AI extraction returned null')
-    return { recipe: null, reason: 'ai-failed' }
+    return { recipe: null, reason: 'failed', captionsAvailable }
   }
 
   recipe.sourceType = 'youtube'
@@ -540,15 +542,11 @@ app.post('/api/extract-recipe', async (req, res) => {
       console.log('[extract-recipe] YouTube extraction succeeded')
       return res.json(result.recipe)
     }
-    console.log('[extract-recipe] YouTube extraction failed:', result.reason)
-    if (result.reason === 'no-captions') {
-      return res.status(422).json({
-        error: 'We couldn\'t find captions for this YouTube video. Paste the transcript or description manually.',
-      })
-    }
-    return res.status(422).json({
-      error: 'We couldn\'t extract enough recipe details from this YouTube link. Paste the video description or transcript manually.',
-    })
+    console.log('[extract-recipe] YouTube extraction failed:', result.reason || 'unknown')
+    const msg = result.captionsAvailable
+      ? 'We couldn\'t extract enough recipe details from this YouTube link. Paste the video description or transcript manually.'
+      : 'We couldn\'t find captions for this YouTube video. Paste the transcript or description manually.'
+    return res.status(422).json({ error: msg })
   }
 
   // ── Step 1: Direct page fetch ──
