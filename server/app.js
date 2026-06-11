@@ -102,98 +102,49 @@ function extractOpenGraph(html) {
   return og
 }
 
-app.post('/api/extract-recipe', async (req, res) => {
-  const { url } = req.body
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Chrome/120 Safari/605.1.15',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148',
+  'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36',
+]
 
-  console.log('[extract-recipe] Request received', { url })
+function pickUA() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]
+}
 
-  if (!url) {
-    return res.status(400).json({ error: 'URL is required' })
+async function fetchWithFallback(url, timeoutMs = 15000) {
+  const ua = pickUA()
+  console.log('[extract] Fetching with UA:', ua.slice(0, 50))
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': ua,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Cache-Control': 'no-cache',
+    },
+    signal: AbortSignal.timeout(timeoutMs),
+  })
+  return res
+}
+
+async function tryAiExtraction(text, sourceUrl, label) {
+  console.log(`[extract] ${label}: AI extraction starting, text length: ${text.length}`)
+  if (!process.env.NVIDIA_API_KEY) {
+    console.log(`[extract] ${label}: No NVIDIA_API_KEY, skipping AI`)
+    return null
   }
-
-  try {
-    console.log('[extract-recipe] Fetching URL:', url)
-
-    const pageRes = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-      signal: AbortSignal.timeout(10000),
-    })
-
-    console.log('[extract-recipe] Fetch response:', pageRes.status, pageRes.statusText)
-
-    if (!pageRes.ok) {
-      const html = await pageRes.text().catch(() => '')
-      console.log('[extract-recipe] Page fetch failed, html length:', html.length)
-
-      // Try JSON-LD from error page
-      const jsonLd = extractJsonLd(html)
-      if (jsonLd) {
-        console.log('[extract-recipe] Found JSON-LD in error page')
-        const recipe = jsonLdToRecipe(jsonLd, url)
-        return res.json({ ...recipe, warning: 'Recipe extraction may be incomplete. Please review before saving.', confidence: 40 })
-      }
-
-      // Try OpenGraph from error page
-      const og = extractOpenGraph(html)
-      if (og.title) {
-        console.log('[extract-recipe] Found OpenGraph in error page')
-        return res.json({
-          name: og.title,
-          servings: '2',
-          category: 'Dinner',
-          ingredients: [],
-          steps: [],
-          sourceUrl: url,
-          warning: 'Recipe extraction may be incomplete. Please review before saving.',
-          confidence: 20,
-        })
-      }
-
-      const domain = new URL(url).hostname
-      console.error('[extract-recipe] Blocked domain:', domain, 'Status:', pageRes.status, pageRes.statusText)
-      return res.status(422).json({ error: 'This website blocks direct access. Paste recipe text instead.' })
-    }
-
-    const html = await pageRes.text()
-    console.log('[extract-recipe] Page HTML length:', html.length)
-
-    // Try JSON-LD from page body (skip AI if we have structured data)
-    const jsonLd = extractJsonLd(html)
-    if (jsonLd) {
-      const recipe = jsonLdToRecipe(jsonLd, url)
-      if (recipe.ingredients.length > 0 || recipe.steps.length > 0) {
-        console.log('[extract-recipe] Used JSON-LD data, ingredients:', recipe.ingredients.length, 'steps:', recipe.steps.length)
-        return res.json(recipe)
-      }
-    }
-
-    const cleaned = extractTextFromHtml(html)
-    console.log('[extract-recipe] Cleaned text length:', cleaned?.length)
-
-    if (!cleaned) {
-      return res.status(422).json({ error: 'Could not extract text from URL' })
-    }
-
-    console.log('[extract-recipe] Calling NVIDIA AI...')
-    console.log('[extract-recipe] NVIDIA_API_KEY set:', !!process.env.NVIDIA_API_KEY)
-    console.log('[extract-recipe] NVIDIA_MODEL:', process.env.NVIDIA_MODEL)
-
-    const systemMessage = `You are a recipe extractor. Extract recipe information from the provided text and return ONLY valid JSON with this exact structure, no markdown, no extra text:
+  const systemMessage = `You are a recipe extractor. Extract recipe information from the provided text and return ONLY valid JSON with this exact structure, no markdown, no extra text:
 {
   "name": "Recipe name",
   "servings": 2,
   "category": "Breakfast|Lunch|Dinner|Dessert|Drinks",
   "ingredients": ["ingredient 1", "ingredient 2"],
-  "steps": ["step 1", "step 2"],
-  "sourceUrl": "${url.replace(/"/g, '\\"')}"
+  "steps": ["step 1", "step 2"]
 }
 
 If category is not clear, use "Dinner". If ingredients or steps are missing, use empty arrays. Servings defaults to 2 if not found.`
-
+  try {
     const aiRes = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -204,90 +155,168 @@ If category is not clear, use "Dinner". If ingredients or steps are missing, use
         model: process.env.NVIDIA_MODEL || 'meta/llama-3.3-70b-instruct',
         messages: [
           { role: 'system', content: systemMessage },
-          { role: 'user', content: cleaned.slice(0, 8000) },
+          { role: 'user', content: text.slice(0, 8000) },
         ],
         temperature: 0.1,
         max_tokens: 1500,
       }),
       signal: AbortSignal.timeout(30000),
     })
-
-    console.log('[extract-recipe] NVIDIA AI response status:', aiRes.status)
-
+    console.log(`[extract] ${label}: AI response status:`, aiRes.status)
     if (!aiRes.ok) {
       const errText = await aiRes.text()
-      console.error('[extract-recipe] NVIDIA API error:', aiRes.status, errText)
-      return res.status(502).json({ error: 'AI extraction failed' })
+      console.error(`[extract] ${label}: AI API error:`, aiRes.status, errText)
+      return null
     }
-
     const aiData = await aiRes.json()
     let content = aiData.choices?.[0]?.message?.content
-
     if (!content) {
-      console.error('[extract-recipe] NVIDIA returned empty content')
-      return res.status(502).json({ error: 'AI returned empty response' })
+      console.error(`[extract] ${label}: AI returned empty content`)
+      return null
     }
-
-    console.log('[extract-recipe] NVIDIA raw content length:', content.length)
-
     content = content.replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '').trim()
-
-    let recipe
-    try {
-      recipe = JSON.parse(content)
-    } catch (parseErr) {
-      console.error('[extract-recipe] JSON parse error on content:', content.substring(0, 500))
-      return res.status(502).json({ error: 'AI returned invalid JSON' })
-    }
-
-    // Clean raw output
-    recipe.sourceUrl = url
-    recipe.ingredients = Array.isArray(recipe.ingredients) ? recipe.ingredients : []
-    recipe.steps = Array.isArray(recipe.steps) ? recipe.steps : []
-
-    recipe.ingredients = recipe.ingredients
-      .map(i => i.trim())
-      .filter((i, idx, arr) => i && arr.findIndex(x => x.toLowerCase() === i.toLowerCase()) === idx)
-
-    recipe.steps = recipe.steps
-      .map(s => s.trim().replace(/^(Step\s+\d+[:\s]+|Step\s+#?\d+\s*[:\-–—]?\s*|\d+[\.\)]\s*|\d+\.\s*)/i, '').trim())
-      .filter((s, idx, arr) => s && arr.findIndex(x => x.toLowerCase() === s.toLowerCase()) === idx)
-
-    if (!recipe.name || !recipe.name.trim()) {
-      recipe.name = 'Imported Recipe'
-    }
-    recipe.name = recipe.name.trim()
-    recipe.servings = recipe.servings || 2
-    recipe.category = recipe.category || 'Dinner'
-
-    // Confidence score (0-100)
-    let score = 0
-    if (recipe.name && recipe.name !== 'Imported Recipe') score += 20
-    if (recipe.servings) score += 10
-    if (recipe.category) score += 10
-    score += Math.min(recipe.ingredients.length * 5, 30)
-    score += Math.min(recipe.steps.length * 5, 30)
-    recipe.confidence = score
-
-    // Validation warning (always return recipe, warn if weak)
-    let warning = ''
-    if (recipe.ingredients.length < 2 || recipe.steps.length < 1) {
-      warning = 'Recipe extraction may be incomplete. Please review before saving.'
-    }
-    if (warning) recipe.warning = warning
-
-    console.log('[extract-recipe] Success, returning recipe:', recipe.name, 'ingredients:', recipe.ingredients.length, 'steps:', recipe.steps.length)
-    res.json(recipe)
+    const recipe = JSON.parse(content)
+    recipe.sourceUrl = sourceUrl
+    return finalizeRecipe(recipe, sourceUrl)
   } catch (err) {
-    console.error('[extract-recipe] Unhandled error:', err.message, err.stack)
-    if (err.name === 'AbortError' || err.code === 'UND_ERR_CONNECT_TIMEOUT') {
-      return res.status(504).json({ error: 'Request timed out' })
-    }
-    let domain = 'unknown'
-    try { if (url) domain = new URL(url).hostname } catch { /* ignore invalid url */ }
-    console.error('[extract-recipe] Error for domain:', domain, 'Error:', err.message)
-    return res.status(422).json({ error: 'Could not access this URL. The website may block direct access.' })
+    console.error(`[extract] ${label}: AI extraction error:`, err.message)
+    return null
   }
+}
+
+app.post('/api/extract-recipe', async (req, res) => {
+  const { url } = req.body
+  console.log('[extract-recipe] Request received', { url })
+  if (!url) return res.status(400).json({ error: 'URL is required' })
+
+  const domain = new URL(url).hostname
+  console.log('[extract-recipe] Domain:', domain)
+
+  // ── Step 1: Direct page fetch ──
+  let directHtml = null
+  let directFetchFailed = false
+  try {
+    console.log('[extract-recipe] Step 1: Direct page fetch')
+    const pageRes = await fetchWithFallback(url)
+    console.log('[extract-recipe] Step 1: Status', pageRes.status, pageRes.statusText)
+    if (pageRes.ok) {
+      directHtml = await pageRes.text()
+      console.log('[extract-recipe] Step 1: HTML length:', directHtml.length)
+      // If page is too short, likely blocked — treat as failed
+      if (directHtml.length < 500) {
+        console.log('[extract-recipe] Step 1: HTML too short (' + directHtml.length + '), treating as blocked')
+        directFetchFailed = true
+      }
+    } else {
+      directFetchFailed = true
+      const body = await pageRes.text().catch(() => '')
+      console.log('[extract-recipe] Step 1: Non-OK response, body length:', body.length)
+      // Still try to extract from error page body
+      if (body.length > 100) directHtml = body
+    }
+  } catch (err) {
+    console.log('[extract-recipe] Step 1: Fetch error:', err.message)
+    directFetchFailed = true
+  }
+
+  // ── Step 2: Try JSON-LD from direct HTML ──
+  if (directHtml) {
+    console.log('[extract-recipe] Step 2: Looking for JSON-LD schema.org Recipe')
+    const jsonLd = extractJsonLd(directHtml)
+    if (jsonLd) {
+      const recipe = jsonLdToRecipe(jsonLd, url)
+      const hasIngredients = recipe.ingredients.length > 0
+      const hasSteps = recipe.steps.length > 0
+      console.log('[extract-recipe] Step 2: JSON-LD found, ingredients:', recipe.ingredients.length, 'steps:', recipe.steps.length)
+      if (hasIngredients && hasSteps) {
+        console.log('[extract-recipe] Step 2: Complete JSON-LD recipe, returning')
+        return res.json(recipe)
+      }
+      // Partial JSON-LD: attach warning, return what we have
+      console.log('[extract-recipe] Step 2: Partial JSON-LD, attaching warning')
+      recipe.warning = 'Recipe extraction may be incomplete. Please review before saving.'
+      return res.json(recipe)
+    }
+    console.log('[extract-recipe] Step 2: No JSON-LD found')
+  }
+
+  // ── Step 3: Try AI on cleaned direct-fetch text ──
+  if (directHtml && !directFetchFailed) {
+    console.log('[extract-recipe] Step 3: AI extraction on direct fetch text')
+    const cleaned = extractTextFromHtml(directHtml)
+    if (cleaned && cleaned.length > 100) {
+      const recipe = await tryAiExtraction(cleaned, url, 'direct-AI')
+      if (recipe) {
+        console.log('[extract-recipe] Step 3: AI extraction succeeded, returning recipe')
+        return res.json(recipe)
+      }
+      console.log('[extract-recipe] Step 3: AI extraction returned null')
+    } else {
+      console.log('[extract-recipe] Step 3: Cleaned text too short (' + (cleaned?.length || 0) + '), skipping AI')
+    }
+  } else {
+    console.log('[extract-recipe] Step 3: Skipping direct AI (fetch failed or no HTML)')
+  }
+
+  // ── Step 4: Jina Reader fallback ──
+  let jinaText = null
+  try {
+    console.log('[extract-recipe] Step 4: Jina Reader fallback')
+    const jinaUrl = `https://r.jina.ai/${url}`
+    const jinaRes = await fetch(jinaUrl, {
+      headers: {
+        'Accept': 'text/plain',
+        ...(process.env.JINA_API_KEY ? { 'Authorization': `Bearer ${process.env.JINA_API_KEY}` } : {}),
+      },
+      signal: AbortSignal.timeout(20000),
+    })
+    console.log('[extract-recipe] Step 4: Jina status:', jinaRes.status)
+    if (jinaRes.ok) {
+      jinaText = await jinaRes.text()
+      console.log('[extract-recipe] Step 4: Jina content length:', jinaText.length)
+    } else {
+      const jinaErr = await jinaRes.text().catch(() => '')
+      console.log('[extract-recipe] Step 4: Jina error:', jinaRes.status, jinaErr.slice(0, 200))
+    }
+  } catch (err) {
+    console.log('[extract-recipe] Step 4: Jina fetch error:', err.message)
+  }
+
+  // ── Step 5: Try JSON-LD from Jina text ──
+  if (jinaText) {
+    console.log('[extract-recipe] Step 5: Looking for JSON-LD in Jina content')
+    const jsonLd = extractJsonLd(jinaText)
+    if (jsonLd) {
+      const recipe = jsonLdToRecipe(jsonLd, url)
+      const hasIngredients = recipe.ingredients.length > 0
+      const hasSteps = recipe.steps.length > 0
+      console.log('[extract-recipe] Step 5: JSON-LD from Jina, ingredients:', recipe.ingredients.length, 'steps:', recipe.steps.length)
+      if (hasIngredients && hasSteps) {
+        return res.json(recipe)
+      }
+      if (hasIngredients || hasSteps) {
+        recipe.warning = 'Recipe extraction may be incomplete. Please review before saving.'
+        return res.json(recipe)
+      }
+    }
+  }
+
+  // ── Step 6: Try AI on Jina text ──
+  if (jinaText && jinaText.length > 100) {
+    console.log('[extract-recipe] Step 6: AI extraction on Jina content')
+    const recipe = await tryAiExtraction(jinaText, url, 'Jina-AI')
+    if (recipe) {
+      console.log('[extract-recipe] Step 6: AI on Jina succeeded')
+      return res.json(recipe)
+    }
+    console.log('[extract-recipe] Step 6: AI on Jina returned null')
+  }
+
+  // ── Step 7: All methods failed ──
+  console.log('[extract-recipe] All extraction methods failed for:', url)
+  return res.status(422).json({
+    error: 'We couldn\'t automatically extract this recipe. Try another recipe site or paste the recipe text manually.',
+  })
 })
 
 // Clean + validate a recipe object (shared by extract and generate)
