@@ -220,6 +220,7 @@ app.post('/api/extract-recipe', async (req, res) => {
   }
 
   // ── Step 2: Try JSON-LD from direct HTML ──
+  let fallbackRecipe = null
   if (directHtml) {
     console.log('[extract-recipe] Step 2: Looking for JSON-LD schema.org Recipe')
     const jsonLd = extractJsonLd(directHtml)
@@ -232,12 +233,12 @@ app.post('/api/extract-recipe', async (req, res) => {
         console.log('[extract-recipe] Step 2: Complete JSON-LD recipe, returning')
         return res.json(recipe)
       }
-      // Partial JSON-LD: attach warning, return what we have
-      console.log('[extract-recipe] Step 2: Partial JSON-LD, attaching warning')
-      recipe.warning = 'Recipe extraction may be incomplete. Please review before saving.'
-      return res.json(recipe)
+      // Partial JSON-LD: save as fallback, continue to AI/Jina
+      console.log('[extract-recipe] Step 2: Partial JSON-LD, saving as fallback')
+      fallbackRecipe = recipe
+    } else {
+      console.log('[extract-recipe] Step 2: No JSON-LD found')
     }
-    console.log('[extract-recipe] Step 2: No JSON-LD found')
   }
 
   // ── Step 3: Try AI on cleaned direct-fetch text ──
@@ -294,9 +295,9 @@ app.post('/api/extract-recipe', async (req, res) => {
       if (hasIngredients && hasSteps) {
         return res.json(recipe)
       }
+      // Partial: save as fallback, continue to AI
       if (hasIngredients || hasSteps) {
-        recipe.warning = 'Recipe extraction may be incomplete. Please review before saving.'
-        return res.json(recipe)
+        if (!fallbackRecipe) fallbackRecipe = recipe
       }
     }
   }
@@ -312,7 +313,32 @@ app.post('/api/extract-recipe', async (req, res) => {
     console.log('[extract-recipe] Step 6: AI on Jina returned null')
   }
 
-  // ── Step 7: All methods failed ──
+  // ── Step 7: Return fallback (partial JSON-LD) if available ──
+  if (fallbackRecipe) {
+    console.log('[extract-recipe] Step 7: Returning fallback partial JSON-LD recipe')
+    fallbackRecipe.warning = 'Recipe extraction may be incomplete. Please review before saving.'
+    return res.json(fallbackRecipe)
+  }
+
+  // ── Step 8: Try OpenGraph from direct HTML as last resort ──
+  if (directHtml) {
+    const og = extractOpenGraph(directHtml)
+    if (og.title) {
+      console.log('[extract-recipe] Step 8: Returning OpenGraph fallback')
+      const ogRecipe = {
+        name: og.title,
+        servings: '2',
+        category: 'Dinner',
+        ingredients: [],
+        steps: [],
+        sourceUrl: url,
+        warning: 'We couldn\'t fully extract this recipe. Try another recipe site or paste the recipe text manually.',
+      }
+      return res.json(ogRecipe)
+    }
+  }
+
+  // ── Step 9: All methods failed ──
   console.log('[extract-recipe] All extraction methods failed for:', url)
   return res.status(422).json({
     error: 'We couldn\'t automatically extract this recipe. Try another recipe site or paste the recipe text manually.',
