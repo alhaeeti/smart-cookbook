@@ -268,9 +268,50 @@ function isErrorPage(text) {
     /404\s+not\s+found/i,
     /could\s+not\s+be\s+found/i,
     /this\s+page\s+(?:doesn't|does\s+not)\s+exist/i,
+    /forbidden/i,
+    /request\s+blocked/i,
+    /cloudflare/i,
+    /just\s+a\s+moment/i,
+    /you\s+don't\s+have\s+permission/i,
+    /blocked/i,
   ]
   const firstLines = text.slice(0, 500)
   for (const pattern of errorPatterns) {
+    if (pattern.test(firstLines)) {
+      return true
+    }
+  }
+  const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
+  if (titleMatch) {
+    const title = titleMatch[1].replace(/<[^>]+>/g, '').trim()
+    const titlePatterns = [
+      /^access\s+denied/i,
+      /^forbidden/i,
+      /^403/i,
+      /^error/i,
+      /^attention\s+required/i,
+      /^page\s+not\s+found/i,
+    ]
+    for (const p of titlePatterns) {
+      if (p.test(title)) return true
+    }
+  }
+  return false
+}
+
+function isBlockedPage(text) {
+  const blockedPatterns = [
+    /access\s+denied/i,
+    /attention\s+required/i,
+    /cloudflare/i,
+    /just\s+a\s+moment/i,
+    /you\s+don't\s+have\s+permission/i,
+    /request\s+blocked/i,
+    /blocked/i,
+    /403\s+forbidden/i,
+  ]
+  const firstLines = text.slice(0, 500)
+  for (const pattern of blockedPatterns) {
     if (pattern.test(firstLines)) {
       return true
     }
@@ -378,8 +419,9 @@ app.post('/api/extract-recipe', async (req, res) => {
 
   // Detect error page
   const directIsError = directHtml ? isErrorPage(directHtml) : false
+  const wasBlocked = directHtml ? isBlockedPage(directHtml) : false
   if (directIsError) {
-    console.log('[extract-recipe] Direct HTML is an error page, marking as failed')
+    console.log('[extract-recipe] Direct HTML is an error page (blocked:', wasBlocked, '), marking as failed')
     directFetchFailed = true
   }
 
@@ -519,25 +561,34 @@ app.post('/api/extract-recipe', async (req, res) => {
   }
 
   // ── Step 8: Try OpenGraph from direct HTML as last resort ──
-  if (directHtml) {
+  if (directHtml && !directIsError) {
     const og = extractOpenGraph(directHtml)
     if (og.title) {
-      console.log('[extract-recipe] Step 8: Returning OpenGraph fallback')
-      const ogRecipe = {
-        name: og.title,
-        servings: '2',
-        category: 'Dinner',
-        ingredients: [],
-        steps: [],
-        sourceUrl: url,
-        warning: 'We couldn\'t fully extract this recipe. Try another recipe site or paste the recipe text manually.',
+      const errorTitle = /^(access\s+denied|forbidden|error|403|attention\s+required|page\s+not\s+found)/i
+      if (!errorTitle.test(og.title)) {
+        console.log('[extract-recipe] Step 8: Returning OpenGraph fallback')
+        const ogRecipe = {
+          name: og.title,
+          servings: '2',
+          category: 'Dinner',
+          ingredients: [],
+          steps: [],
+          sourceUrl: url,
+          warning: 'We couldn\'t fully extract this recipe. Try another recipe site or paste the recipe text manually.',
+        }
+        return res.json(ogRecipe)
       }
-      return res.json(ogRecipe)
+      console.log('[extract-recipe] Step 8: Skipping OpenGraph (title is error page)')
     }
   }
 
   // ── Step 9: All methods failed ──
   console.log('[extract-recipe] All extraction methods failed for:', url)
+  if (wasBlocked) {
+    return res.status(422).json({
+      error: 'This website blocks automated access. Paste recipe text instead.',
+    })
+  }
   return res.status(422).json({
     error: 'We couldn\'t automatically extract this recipe. Try another recipe site or paste the recipe text manually.',
   })
@@ -559,6 +610,9 @@ function finalizeRecipe(recipe, sourceUrl) {
 
   if (!recipe.name || !recipe.name.trim()) recipe.name = 'Imported Recipe'
   recipe.name = recipe.name.trim()
+  if (/^(access\s+denied|forbidden|error|403|attention\s+required|page\s+not\s+found)/i.test(recipe.name)) {
+    recipe.name = 'Imported Recipe'
+  }
   recipe.servings = recipe.servings || 2
   recipe.category = recipe.category || 'Dinner'
 
