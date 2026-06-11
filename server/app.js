@@ -7,6 +7,13 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
+// Startup logging
+console.log('[server] NODE_ENV:', process.env.NODE_ENV)
+console.log('[server] NVIDIA_API_KEY set:', !!process.env.NVIDIA_API_KEY)
+console.log('[server] NVIDIA_MODEL:', process.env.NVIDIA_MODEL || 'default (meta/llama-3.3-70b-instruct)')
+
+app.set('trust proxy', true)
+
 function extractTextFromHtml(html) {
   let text = html
   text = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
@@ -267,9 +274,10 @@ If category is not clear, use "Dinner". If ingredients or steps are missing, use
     if (err.name === 'AbortError' || err.code === 'UND_ERR_CONNECT_TIMEOUT') {
       return res.status(504).json({ error: 'Request timed out' })
     }
-    const domain = url ? new URL(url).hostname : 'unknown'
-    console.error('[extract-recipe] Blocked domain:', domain, 'Error:', err.message)
-    return res.status(422).json({ error: 'This website blocks direct access. Paste recipe text instead.' })
+    let domain = 'unknown'
+    try { if (url) domain = new URL(url).hostname } catch { /* ignore invalid url */ }
+    console.error('[extract-recipe] Error for domain:', domain, 'Error:', err.message)
+    return res.status(422).json({ error: 'Could not access this URL. The website may block direct access.' })
   }
 })
 
@@ -391,9 +399,15 @@ Use category Breakfast, Lunch, Dinner, Dessert, or Drinks. Default to Dinner if 
     if (err.name === 'AbortError' || err.code === 'UND_ERR_CONNECT_TIMEOUT') {
       return res.status(504).json({ error: 'Request timed out' })
     }
-    console.error('[generate-recipe] Error:', err)
+    console.error('[generate-recipe] Error:', err.message)
     res.status(500).json({ error: 'Internal server error' })
   }
+})
+
+// Global error handler — always returns JSON
+app.use((err, req, res, next) => {
+  console.error('[server] Unhandled error:', err.message, err.stack)
+  res.status(500).json({ error: 'Internal server error' })
 })
 
 export default app
