@@ -43,29 +43,103 @@ function extractTextFromHtml(html) {
   return lines.slice(0, 60).join('\n\n')
 }
 
-function extractJsonLd(html) {
-  const regex = /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi
-  let match
-  while ((match = regex.exec(html)) !== null) {
-    try {
-      const parsed = JSON.parse(match[1].trim())
-      const items = parsed['@graph'] || [parsed]
-      for (const item of items) {
-        if (item['@type'] === 'Recipe' || item['@type'] === 'http://schema.org/Recipe') {
-          return item
+function findAllJsonLd(html) {
+  const blocks = []
+  const patterns = [
+    /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi,
+    /<script[^>]*type=application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi,
+  ]
+  for (const regex of patterns) {
+    let match
+    while ((match = regex.exec(html)) !== null) {
+      try {
+        const data = JSON.parse(match[1].trim())
+        const items = Array.isArray(data) ? data : (data['@graph'] || [data])
+        for (const item of items) {
+          if (item && typeof item === 'object' && item['@type']) {
+            blocks.push(item)
+          }
         }
+      } catch {
+        // skip malformed blocks
       }
-    } catch {
-      // skip malformed JSON-LD blocks
+    }
+  }
+  return blocks
+}
+
+function logAllJsonLdBlocks(html, label) {
+  const blocks = findAllJsonLd(html)
+  console.log(`[extract] ${label}: Total JSON-LD blocks found: ${blocks.length}`)
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i]
+    const type = b['@type'] || 'unknown'
+    const name = b.name || b.headline || '(no name)'
+    const isRecipe = type === 'Recipe' || type === 'http://schema.org/Recipe'
+    const ings = isRecipe ? (Array.isArray(b.recipeIngredient) ? b.recipeIngredient.length : 0) : '-'
+    const instr = isRecipe ? (Array.isArray(b.recipeInstructions) ? b.recipeInstructions.length : 0) : '-'
+    console.log(`[extract] ${label}:   Block ${i}: @type="${type}", name="${name}", recipeIngredient=${ings}, recipeInstructions=${instr}`)
+  }
+}
+
+function extractJsonLd(html) {
+  const blocks = findAllJsonLd(html)
+  for (const item of blocks) {
+    const type = item['@type'] || ''
+    if (type === 'Recipe' || type === 'http://schema.org/Recipe') {
+      return item
     }
   }
   return null
 }
 
+function findRecipeContent(text) {
+  const markers = [
+    /^##\s*Ingredients/im,
+    /^##\s*Directions/im,
+    /^##\s*Instructions/im,
+    /^##\s*Method/im,
+  ]
+  let firstIdx = text.length
+  for (const marker of markers) {
+    const m = marker.exec(text)
+    if (m && m.index < firstIdx) {
+      firstIdx = m.index
+    }
+  }
+  if (firstIdx < text.length) {
+    return text.slice(firstIdx).slice(0, 8000)
+  }
+  const lines = text.split('\n')
+  const recipeLines = []
+  let inRecipe = false
+  for (const line of lines) {
+    if (/^##\s+(Ingredients|Directions|Instructions|Method|Steps)/i.test(line)) {
+      inRecipe = true
+    }
+    if (inRecipe) {
+      recipeLines.push(line)
+    }
+  }
+  if (recipeLines.length > 0) {
+    return recipeLines.join('\n').slice(0, 8000)
+  }
+  const h1Line = lines.find(l => /^#\s+/.test(l))
+  if (h1Line) {
+    const h1Idx = lines.indexOf(h1Line)
+    return lines.slice(h1Idx).join('\n').slice(0, 8000)
+  }
+  return text.slice(0, 8000)
+}
+
 function jsonLdToRecipe(data, url) {
-  const ingredients = Array.isArray(data.recipeIngredient)
-    ? data.recipeIngredient.map(i => typeof i === 'string' ? i : '').filter(Boolean)
-    : []
+  const ingredients = []
+  if (Array.isArray(data.recipeIngredient)) {
+    for (const i of data.recipeIngredient) {
+      if (typeof i === 'string') ingredients.push(i)
+      else if (i && typeof i === 'object' && i.name) ingredients.push(i.name)
+    }
+  }
 
   const steps = []
   if (Array.isArray(data.recipeInstructions)) {
@@ -74,18 +148,41 @@ function jsonLdToRecipe(data, url) {
         steps.push(instruction)
       } else if (instruction['@type'] === 'HowToStep' && instruction.text) {
         steps.push(instruction.text)
+      } else if (instruction['@type'] === 'HowToSection') {
+        if (instruction.name) steps.push(instruction.name)
+        if (Array.isArray(instruction.itemListElement)) {
+          for (const step of instruction.itemListElement) {
+            if (typeof step === 'string') steps.push(step)
+            else if (step.text) steps.push(step.text)
+          }
+        }
       } else if (instruction.itemListElement) {
         for (const step of instruction.itemListElement) {
-          if (step.text) steps.push(step.text)
+          if (typeof step === 'string') steps.push(step)
+          else if (step.text) steps.push(step.text)
         }
+      } else if (instruction.name && typeof instruction.name === 'string') {
+        steps.push(instruction.name)
       }
     }
   }
 
+  let servings = '2'
+  if (data.recipeYield) {
+    if (Array.isArray(data.recipeYield)) {
+      servings = String(data.recipeYield[0]).replace(/[^0-9]/g, '') || '2'
+    } else {
+      servings = String(data.recipeYield).replace(/[^0-9]/g, '') || '2'
+    }
+  }
+
+  let category = data.recipeCategory || 'Dinner'
+  if (Array.isArray(category)) category = category[0] || 'Dinner'
+
   return {
     name: data.name || 'Imported Recipe',
-    servings: data.recipeYield ? String(data.recipeYield).replace(/[^0-9]/g, '') || '2' : '2',
-    category: data.recipeCategory || data['@type'] || 'Dinner',
+    servings,
+    category,
     ingredients,
     steps,
     sourceUrl: url,
@@ -98,6 +195,12 @@ function extractOpenGraph(html) {
   let match
   while ((match = regex.exec(html)) !== null) {
     og[match[1].toLowerCase()] = match[2]
+  }
+  if (!og.title) {
+    const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
+    if (titleMatch) {
+      og.title = titleMatch[1].replace(/<[^>]+>/g, '').trim()
+    }
   }
   return og
 }
@@ -128,12 +231,61 @@ async function fetchWithFallback(url, timeoutMs = 15000) {
   return res
 }
 
+async function fetchViaProxy(url) {
+  const proxies = [
+    { name: 'Jina', makeUrl: u => `https://r.jina.ai/${u}`, opts: { headers: { 'Accept': 'text/html' } } },
+    { name: 'GoogleCache', makeUrl: u => `https://webcache.googleusercontent.com/search?q=cache:${u}`, opts: {} },
+  ]
+  for (const proxy of proxies) {
+    try {
+      const proxyUrl = proxy.makeUrl(url)
+      console.log('[extract] Trying proxy:', proxy.name, proxyUrl.slice(0, 80))
+      const res = await fetch(proxyUrl, {
+        ...proxy.opts,
+        signal: AbortSignal.timeout(20000),
+      })
+      if (res.ok) {
+        const text = await res.text()
+        if (text && text.length > 1000) {
+          console.log('[extract] Proxy', proxy.name, 'returned:', text.length, 'bytes')
+          return text
+        }
+      } else {
+        console.log('[extract] Proxy', proxy.name, 'status:', res.status)
+      }
+    } catch (err) {
+      console.log('[extract] Proxy error:', proxy.name, err.message)
+    }
+  }
+  return null
+}
+
+function isErrorPage(text) {
+  const errorPatterns = [
+    /page\s+not\s+found/i,
+    /access\s+denied/i,
+    /attention\s+required/i,
+    /404\s+not\s+found/i,
+    /could\s+not\s+be\s+found/i,
+    /this\s+page\s+(?:doesn't|does\s+not)\s+exist/i,
+  ]
+  const firstLines = text.slice(0, 500)
+  for (const pattern of errorPatterns) {
+    if (pattern.test(firstLines)) {
+      return true
+    }
+  }
+  return false
+}
+
 async function tryAiExtraction(text, sourceUrl, label) {
   console.log(`[extract] ${label}: AI extraction starting, text length: ${text.length}`)
   if (!process.env.NVIDIA_API_KEY) {
     console.log(`[extract] ${label}: No NVIDIA_API_KEY, skipping AI`)
     return null
   }
+  const recipeSection = findRecipeContent(text)
+  console.log(`[extract] ${label}: Recipe section length: ${recipeSection.length}`)
   const systemMessage = `You are a recipe extractor. Extract recipe information from the provided text and return ONLY valid JSON with this exact structure, no markdown, no extra text:
 {
   "name": "Recipe name",
@@ -155,7 +307,7 @@ If category is not clear, use "Dinner". If ingredients or steps are missing, use
         model: process.env.NVIDIA_MODEL || 'meta/llama-3.3-70b-instruct',
         messages: [
           { role: 'system', content: systemMessage },
-          { role: 'user', content: text.slice(0, 8000) },
+          { role: 'user', content: recipeSection },
         ],
         temperature: 0.1,
         max_tokens: 1500,
@@ -219,30 +371,74 @@ app.post('/api/extract-recipe', async (req, res) => {
     directFetchFailed = true
   }
 
-  // ── Step 2: Try JSON-LD from direct HTML ──
-  let fallbackRecipe = null
+  // ── Step 2: Log all JSON-LD blocks found ──
   if (directHtml) {
-    console.log('[extract-recipe] Step 2: Looking for JSON-LD schema.org Recipe')
+    logAllJsonLdBlocks(directHtml, 'direct-HTML')
+  }
+
+  // Detect error page
+  const directIsError = directHtml ? isErrorPage(directHtml) : false
+  if (directIsError) {
+    console.log('[extract-recipe] Direct HTML is an error page, marking as failed')
+    directFetchFailed = true
+  }
+
+  // ── Step 2a: Try proxy HTML fetch if direct fetch failed ──
+  let proxyHtml = null
+  if (directFetchFailed) {
+    console.log('[extract-recipe] Step 2a: Trying proxy HTML fetch')
+    proxyHtml = await fetchViaProxy(url)
+    if (proxyHtml) {
+      logAllJsonLdBlocks(proxyHtml, 'proxy-HTML')
+    }
+  }
+
+  // ── Step 2b: Try JSON-LD from proxy HTML ──
+  if (proxyHtml) {
+    console.log('[extract-recipe] Step 2b: Looking for JSON-LD in proxy HTML')
+    const jsonLd = extractJsonLd(proxyHtml)
+    if (jsonLd) {
+      const recipe = jsonLdToRecipe(jsonLd, url)
+      const hasIngredients = recipe.ingredients.length > 0
+      const hasSteps = recipe.steps.length > 0
+      console.log('[extract-recipe] Step 2b: JSON-LD from proxy, ingredients:', recipe.ingredients.length, 'steps:', recipe.steps.length)
+      if (hasIngredients && hasSteps) {
+        console.log('[extract-recipe] Step 2b: Complete JSON-LD from proxy, returning')
+        return res.json(recipe)
+      }
+      if (hasIngredients || hasSteps) {
+        console.log('[extract-recipe] Step 2b: Partial JSON-LD from proxy, saving as fallback')
+        if (!fallbackRecipe) fallbackRecipe = recipe
+      }
+    } else {
+      console.log('[extract-recipe] Step 2b: No JSON-LD in proxy HTML')
+    }
+  }
+
+  // ── Step 2c: Try JSON-LD from direct HTML ──
+  let fallbackRecipe = null
+  if (directHtml && !directIsError) {
+    console.log('[extract-recipe] Step 2c: Looking for JSON-LD schema.org Recipe in direct HTML')
     const jsonLd = extractJsonLd(directHtml)
     if (jsonLd) {
       const recipe = jsonLdToRecipe(jsonLd, url)
       const hasIngredients = recipe.ingredients.length > 0
       const hasSteps = recipe.steps.length > 0
-      console.log('[extract-recipe] Step 2: JSON-LD found, ingredients:', recipe.ingredients.length, 'steps:', recipe.steps.length)
+      console.log('[extract-recipe] Step 2c: JSON-LD found, ingredients:', recipe.ingredients.length, 'steps:', recipe.steps.length)
       if (hasIngredients && hasSteps) {
-        console.log('[extract-recipe] Step 2: Complete JSON-LD recipe, returning')
+        console.log('[extract-recipe] Step 2c: Complete JSON-LD recipe, returning')
         return res.json(recipe)
       }
       // Partial JSON-LD: save as fallback, continue to AI/Jina
-      console.log('[extract-recipe] Step 2: Partial JSON-LD, saving as fallback')
+      console.log('[extract-recipe] Step 2c: Partial JSON-LD, saving as fallback')
       fallbackRecipe = recipe
     } else {
-      console.log('[extract-recipe] Step 2: No JSON-LD found')
+      console.log('[extract-recipe] Step 2c: No JSON-LD found')
     }
   }
 
   // ── Step 3: Try AI on cleaned direct-fetch text ──
-  if (directHtml && !directFetchFailed) {
+  if (directHtml && !directFetchFailed && !directIsError) {
     console.log('[extract-recipe] Step 3: AI extraction on direct fetch text')
     const cleaned = extractTextFromHtml(directHtml)
     if (cleaned && cleaned.length > 100) {
@@ -303,7 +499,7 @@ app.post('/api/extract-recipe', async (req, res) => {
   }
 
   // ── Step 6: Try AI on Jina text ──
-  if (jinaText && jinaText.length > 100) {
+  if (jinaText && jinaText.length > 100 && !isErrorPage(jinaText)) {
     console.log('[extract-recipe] Step 6: AI extraction on Jina content')
     const recipe = await tryAiExtraction(jinaText, url, 'Jina-AI')
     if (recipe) {
@@ -311,6 +507,8 @@ app.post('/api/extract-recipe', async (req, res) => {
       return res.json(recipe)
     }
     console.log('[extract-recipe] Step 6: AI on Jina returned null')
+  } else if (jinaText && isErrorPage(jinaText)) {
+    console.log('[extract-recipe] Step 6: Skipping AI on Jina (page is error page)')
   }
 
   // ── Step 7: Return fallback (partial JSON-LD) if available ──
