@@ -319,6 +319,164 @@ function isBlockedPage(text) {
   return false
 }
 
+function isYoutubeUrl(url) {
+  return /youtube\.com\/(watch\?v=|shorts\/|embed\/)|youtu\.be\//i.test(url)
+}
+
+function extractYoutubeVideoId(url) {
+  const patterns = [
+    /youtube\.com\/watch\?v=([^&?#]+)/,
+    /youtu\.be\/([^?#]+)/,
+    /youtube\.com\/shorts\/([^?#]+)/,
+    /youtube\.com\/embed\/([^?#]+)/,
+  ]
+  for (const p of patterns) {
+    const m = url.match(p)
+    if (m) return m[1]
+  }
+  return null
+}
+
+async function fetchYoutubeMetadata(videoId) {
+  const metadata = { title: '', description: '', thumbnail: '' }
+  try {
+    const res = await fetch(
+      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
+      { signal: AbortSignal.timeout(8000) }
+    )
+    if (res.ok) {
+      const data = await res.json()
+      metadata.title = data.title || ''
+      metadata.thumbnail = data.thumbnail_url || ''
+    }
+  } catch (err) {
+    console.log('[youtube] oEmbed error:', err.message)
+  }
+  try {
+    const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      signal: AbortSignal.timeout(10000),
+    })
+    if (pageRes.ok) {
+      const html = await pageRes.text()
+      const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.*?});/)
+      if (playerMatch) {
+        try {
+          const playerData = JSON.parse(playerMatch[1])
+          const shortDesc = playerData?.videoDetails?.shortDescription
+          if (shortDesc && shortDesc.length > metadata.description.length) {
+            metadata.description = shortDesc
+          }
+        } catch {}
+      }
+      if (!metadata.description) {
+        const descMatch = html.match(/<meta\s+name="description"\s+content="([^"]*)"/i)
+        if (descMatch) {
+          metadata.description = descMatch[1]
+            .replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
+        }
+      }
+      if (!metadata.thumbnail) {
+        const thumbMatch = html.match(/<meta\s+property="og:image"\s+content="([^"]*)"/i)
+        if (thumbMatch) metadata.thumbnail = thumbMatch[1]
+      }
+    }
+  } catch (err) {
+    console.log('[youtube] Page fetch error:', err.message)
+  }
+  return metadata
+}
+
+async function fetchYoutubeTranscript(videoId) {
+  try {
+    const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+      },
+      signal: AbortSignal.timeout(10000),
+    })
+    if (!pageRes.ok) return null
+    const html = await pageRes.text()
+    const match = html.match(/ytInitialPlayerResponse\s*=\s*({.*?});/)
+    if (!match) return null
+    const data = JSON.parse(match[1])
+    const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks
+    if (!tracks || !tracks.length) return null
+    const enTrack = tracks.find(t => t.languageCode === 'en' || t.languageCode === 'en-US')
+    if (!enTrack) return null
+    const transcriptUrl = enTrack.baseUrl + '&fmt=json3'
+    const transcriptRes = await fetch(transcriptUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+      signal: AbortSignal.timeout(10000),
+    })
+    if (!transcriptRes.ok) return null
+    const transcriptData = await transcriptRes.json()
+    const texts = []
+    for (const event of transcriptData.events || []) {
+      if (event.segs) {
+        for (const seg of event.segs) {
+          if (seg.utf8) texts.push(seg.utf8)
+        }
+      }
+    }
+    if (texts.length < 5) return null
+    return texts.join(' ')
+  } catch (err) {
+    console.log('[youtube] Transcript error:', err.message)
+    return null
+  }
+}
+
+async function tryYoutubeExtraction(url) {
+  console.log('[youtube] Starting YouTube extraction for:', url)
+  const videoId = extractYoutubeVideoId(url)
+  if (!videoId) {
+    console.log('[youtube] Could not extract video ID')
+    return null
+  }
+  console.log('[youtube] Video ID:', videoId)
+
+  const metadata = await fetchYoutubeMetadata(videoId)
+  console.log('[youtube] Metadata:', JSON.stringify({ title: metadata.title?.slice(0, 60), descLen: metadata.description?.length, hasThumb: !!metadata.thumbnail }))
+
+  let text = ''
+  if (metadata.title) text += `Recipe Video Title: ${metadata.title}\n\n`
+  if (metadata.description) text += `Video Description:\n${metadata.description}\n\n`
+
+  const transcript = await fetchYoutubeTranscript(videoId)
+  if (transcript) {
+    console.log('[youtube] Transcript length:', transcript.length)
+    text += `Video Transcript:\n${transcript.slice(0, 5000)}`
+  } else {
+    console.log('[youtube] No transcript available')
+  }
+
+  if (!text || text.length < 20) {
+    console.log('[youtube] Not enough text for AI extraction')
+    return null
+  }
+
+  const recipe = await tryAiExtraction(text, url, 'YouTube')
+  if (!recipe) {
+    console.log('[youtube] AI extraction returned null')
+    return null
+  }
+
+  recipe.sourceType = 'youtube'
+  recipe.sourceUrl = url
+  if (metadata.thumbnail) recipe.thumbnail = metadata.thumbnail
+
+  if (recipe.ingredients.length < 2 || recipe.steps.length < 1) {
+    recipe.warning = 'Recipe extraction may be incomplete. Please review before saving.'
+  }
+
+  console.log('[youtube] Extraction result:', recipe.name, 'ingredients:', recipe.ingredients.length, 'steps:', recipe.steps.length)
+  return recipe
+}
+
 async function tryAiExtraction(text, sourceUrl, label) {
   console.log(`[extract] ${label}: AI extraction starting, text length: ${text.length}`)
   if (!process.env.NVIDIA_API_KEY) {
@@ -384,6 +542,20 @@ app.post('/api/extract-recipe', async (req, res) => {
 
   const domain = new URL(url).hostname
   console.log('[extract-recipe] Domain:', domain)
+
+  // ── YouTube detour ──
+  if (isYoutubeUrl(url)) {
+    console.log('[extract-recipe] Detected YouTube URL')
+    const recipe = await tryYoutubeExtraction(url)
+    if (recipe) {
+      console.log('[extract-recipe] YouTube extraction succeeded')
+      return res.json(recipe)
+    }
+    console.log('[extract-recipe] YouTube extraction failed')
+    return res.status(422).json({
+      error: 'We couldn\'t extract enough recipe details from this YouTube link. Paste the video description or transcript manually.',
+    })
+  }
 
   // ── Step 1: Direct page fetch ──
   let directHtml = null
