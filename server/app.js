@@ -14,6 +14,15 @@ console.log('[server] NVIDIA_MODEL:', process.env.NVIDIA_MODEL || 'default (meta
 
 app.set('trust proxy', true)
 
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    envKey: !!process.env.NVIDIA_API_KEY,
+    model: process.env.NVIDIA_MODEL || null,
+  })
+})
+
 function extractTextFromHtml(html) {
   let text = html
   text = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
