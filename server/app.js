@@ -1,6 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import 'dotenv/config'
+import { fetchTranscript } from 'youtube-transcript'
 
 const app = express()
 
@@ -392,41 +393,29 @@ async function fetchYoutubeMetadata(videoId) {
 
 async function fetchYoutubeTranscript(videoId) {
   try {
-    const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
-      },
-      signal: AbortSignal.timeout(10000),
-    })
-    if (!pageRes.ok) return null
-    const html = await pageRes.text()
-    const match = html.match(/ytInitialPlayerResponse\s*=\s*({.*?});/)
-    if (!match) return null
-    const data = JSON.parse(match[1])
-    const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks
-    if (!tracks || !tracks.length) return null
-    const enTrack = tracks.find(t => t.languageCode === 'en' || t.languageCode === 'en-US')
-    if (!enTrack) return null
-    const transcriptUrl = enTrack.baseUrl + '&fmt=json3'
-    const transcriptRes = await fetch(transcriptUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-      signal: AbortSignal.timeout(10000),
-    })
-    if (!transcriptRes.ok) return null
-    const transcriptData = await transcriptRes.json()
-    const texts = []
-    for (const event of transcriptData.events || []) {
-      if (event.segs) {
-        for (const seg of event.segs) {
-          if (seg.utf8) texts.push(seg.utf8)
-        }
+    let segments
+    try {
+      segments = await fetchTranscript(videoId, { lang: 'en' })
+    } catch {
+      try {
+        segments = await fetchTranscript(videoId)
+      } catch {
+        return { text: null, language: null, segments: null }
       }
     }
-    if (texts.length < 5) return null
-    return texts.join(' ')
+    if (!segments || segments.length === 0) {
+      return { text: null, language: null, segments: null }
+    }
+    const text = segments.map(s => s.text).join(' ').trim()
+    if (text.length < 20) {
+      return { text: null, language: null, segments: null }
+    }
+    const language = segments[0]?.lang || 'en'
+    console.log(`[youtube] Transcript: ${segments.length} segments, ${text.length} chars, lang: ${language}`)
+    return { text, language, segments }
   } catch (err) {
     console.log('[youtube] Transcript error:', err.message)
-    return null
+    return { text: null, language: null, segments: null }
   }
 }
 
@@ -440,50 +429,50 @@ async function tryYoutubeExtraction(url) {
   console.log('[youtube] Video ID:', videoId)
 
   const metadata = await fetchYoutubeMetadata(videoId)
-  console.log('[youtube] Metadata:', JSON.stringify({ title: metadata.title?.slice(0, 60), descLen: metadata.description?.length, hasThumb: !!metadata.thumbnail }))
+  const thumbnail = metadata.thumbnail || `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`
+  console.log('[youtube] Metadata:', JSON.stringify({ title: metadata.title?.slice(0, 60), descLen: metadata.description?.length, hasThumb: !!thumbnail }))
+
+  const transcript = await fetchYoutubeTranscript(videoId)
+  if (!transcript.text) {
+    console.log('[youtube] No captions found for this video')
+    return { recipe: null, reason: 'no-captions' }
+  }
 
   let text = ''
   if (metadata.title) text += `Recipe Video Title: ${metadata.title}\n\n`
+  text += `Video Transcript:\n${transcript.text}\n\n`
   if (metadata.description) text += `Video Description:\n${metadata.description}\n\n`
 
-  const transcript = await fetchYoutubeTranscript(videoId)
-  if (transcript) {
-    console.log('[youtube] Transcript length:', transcript.length)
-    text += `Video Transcript:\n${transcript.slice(0, 5000)}`
-  } else {
-    console.log('[youtube] No transcript available')
-  }
-
-  if (!text || text.length < 20) {
+  if (!text || text.length < 50) {
     console.log('[youtube] Not enough text for AI extraction')
-    return null
+    return { recipe: null, reason: 'no-captions' }
   }
 
-  const recipe = await tryAiExtraction(text, url, 'YouTube')
+  const recipe = await tryAiExtraction(text, url, 'YouTube', true)
   if (!recipe) {
     console.log('[youtube] AI extraction returned null')
-    return null
+    return { recipe: null, reason: 'ai-failed' }
   }
 
   recipe.sourceType = 'youtube'
   recipe.sourceUrl = url
-  if (metadata.thumbnail) recipe.thumbnail = metadata.thumbnail
+  recipe.thumbnail = thumbnail
 
   if (recipe.ingredients.length < 2 || recipe.steps.length < 1) {
     recipe.warning = 'Recipe extraction may be incomplete. Please review before saving.'
   }
 
   console.log('[youtube] Extraction result:', recipe.name, 'ingredients:', recipe.ingredients.length, 'steps:', recipe.steps.length)
-  return recipe
+  return { recipe, reason: null }
 }
 
-async function tryAiExtraction(text, sourceUrl, label) {
+async function tryAiExtraction(text, sourceUrl, label, rawContent) {
   console.log(`[extract] ${label}: AI extraction starting, text length: ${text.length}`)
   if (!process.env.NVIDIA_API_KEY) {
     console.log(`[extract] ${label}: No NVIDIA_API_KEY, skipping AI`)
     return null
   }
-  const recipeSection = findRecipeContent(text)
+  const recipeSection = rawContent ? text : findRecipeContent(text)
   console.log(`[extract] ${label}: Recipe section length: ${recipeSection.length}`)
   const systemMessage = `You are a recipe extractor. Extract recipe information from the provided text and return ONLY valid JSON with this exact structure, no markdown, no extra text:
 {
@@ -546,12 +535,17 @@ app.post('/api/extract-recipe', async (req, res) => {
   // ── YouTube detour ──
   if (isYoutubeUrl(url)) {
     console.log('[extract-recipe] Detected YouTube URL')
-    const recipe = await tryYoutubeExtraction(url)
-    if (recipe) {
+    const result = await tryYoutubeExtraction(url)
+    if (result.recipe) {
       console.log('[extract-recipe] YouTube extraction succeeded')
-      return res.json(recipe)
+      return res.json(result.recipe)
     }
-    console.log('[extract-recipe] YouTube extraction failed')
+    console.log('[extract-recipe] YouTube extraction failed:', result.reason)
+    if (result.reason === 'no-captions') {
+      return res.status(422).json({
+        error: 'We couldn\'t find captions for this YouTube video. Paste the transcript or description manually.',
+      })
+    }
     return res.status(422).json({
       error: 'We couldn\'t extract enough recipe details from this YouTube link. Paste the video description or transcript manually.',
     })
