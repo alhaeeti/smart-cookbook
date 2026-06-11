@@ -327,15 +327,17 @@ function finalizeRecipe(recipe, sourceUrl) {
 app.post('/api/generate-recipe', async (req, res) => {
   const { ingredients, cuisine, mealType } = req.body
 
-  console.log('[generate-recipe] Request received', { ingredients, cuisine, mealType })
+  console.log('[generate-recipe] Request body:', JSON.stringify(req.body))
 
   if (!ingredients || !ingredients.trim()) {
     return res.status(400).json({ error: 'Ingredients are required' })
   }
 
   try {
-    console.log('[generate-recipe] NVIDIA_API_KEY set:', !!process.env.NVIDIA_API_KEY)
-    console.log('[generate-recipe] NVIDIA_MODEL:', process.env.NVIDIA_MODEL)
+    const keySet = !!process.env.NVIDIA_API_KEY
+    const model = process.env.NVIDIA_MODEL || 'meta/llama-3.3-70b-instruct'
+    console.log('[generate-recipe] NVIDIA_API_KEY set:', keySet)
+    console.log('[generate-recipe] NVIDIA_MODEL:', model)
 
     const systemMessage = `You are a recipe generator. Generate a complete recipe based on the given ingredients. Return ONLY valid JSON with this exact structure, no markdown, no extra text:
 {
@@ -353,6 +355,17 @@ Use category Breakfast, Lunch, Dinner, Dessert, or Drinks. Default to Dinner if 
     if (mealType) userPrompt += `\nMeal type: ${mealType}`
 
     console.log('[generate-recipe] Calling NVIDIA AI...')
+    console.log('[generate-recipe] Fetch URL: https://integrate.api.nvidia.com/v1/chat/completions')
+    console.log('[generate-recipe] Request model:', model)
+    console.log('[generate-recipe] Request body:', JSON.stringify({
+      model,
+      messages: [
+        { role: 'system', content: '(truncated)' },
+        { role: 'user', content: userPrompt.slice(0, 200) },
+      ],
+      temperature: 0.1,
+      max_tokens: 1500,
+    }))
 
     const aiRes = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
       method: 'POST',
@@ -361,7 +374,7 @@ Use category Breakfast, Lunch, Dinner, Dessert, or Drinks. Default to Dinner if 
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: process.env.NVIDIA_MODEL || 'meta/llama-3.3-70b-instruct',
+        model,
         messages: [
           { role: 'system', content: systemMessage },
           { role: 'user', content: userPrompt },
@@ -373,15 +386,22 @@ Use category Breakfast, Lunch, Dinner, Dessert, or Drinks. Default to Dinner if 
     })
 
     console.log('[generate-recipe] NVIDIA response status:', aiRes.status)
+    console.log('[generate-recipe] NVIDIA response ok:', aiRes.ok)
 
     if (!aiRes.ok) {
       const errText = await aiRes.text()
       console.error('[generate-recipe] NVIDIA API error body:', errText)
-      return res.status(502).json({ error: 'AI generation failed' })
+      return res.status(502).json({
+        error: 'NVIDIA_ERROR',
+        status: aiRes.status,
+        details: errText,
+      })
     }
 
     const aiData = await aiRes.json()
     let content = aiData.choices?.[0]?.message?.content
+    console.log('[generate-recipe] NVIDIA response data keys:', Object.keys(aiData))
+    console.log('[generate-recipe] NVIDIA choices length:', aiData.choices?.length)
 
     if (!content) {
       console.error('[generate-recipe] NVIDIA returned empty content')
@@ -389,6 +409,7 @@ Use category Breakfast, Lunch, Dinner, Dessert, or Drinks. Default to Dinner if 
     }
 
     console.log('[generate-recipe] NVIDIA raw content length:', content.length)
+    console.log('[generate-recipe] NVIDIA raw content (first 200):', content.slice(0, 200))
 
     content = content.replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '').trim()
 
@@ -397,7 +418,10 @@ Use category Breakfast, Lunch, Dinner, Dessert, or Drinks. Default to Dinner if 
       recipe = JSON.parse(content)
     } catch (parseErr) {
       console.error('[generate-recipe] JSON parse error on content:', content.substring(0, 500))
-      return res.status(502).json({ error: 'AI returned invalid JSON' })
+      return res.status(502).json({
+        error: 'AI returned invalid JSON',
+        details: content.slice(0, 500),
+      })
     }
 
     const result = finalizeRecipe(recipe, '')
@@ -405,11 +429,18 @@ Use category Breakfast, Lunch, Dinner, Dessert, or Drinks. Default to Dinner if 
     res.json(result)
   } catch (err) {
     console.error('[generate-recipe] Unhandled error:', err.message, err.stack)
+    console.error('[generate-recipe] Error name:', err.name)
+    console.error('[generate-recipe] Error code:', err.code)
+    console.error('[generate-recipe] Full error:', JSON.stringify(err, Object.getOwnPropertyNames(err)))
     if (err.name === 'AbortError' || err.code === 'UND_ERR_CONNECT_TIMEOUT') {
       return res.status(504).json({ error: 'Request timed out' })
     }
     console.error('[generate-recipe] Error:', err.message)
-    res.status(500).json({ error: 'Internal server error' })
+    res.status(500).json({
+      error: 'Internal server error',
+      details: err.message,
+      name: err.name,
+    })
   }
 })
 
